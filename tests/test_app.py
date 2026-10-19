@@ -1,5 +1,8 @@
 """Behavioral tests cover genuine edge cases without third-party data."""
 
+from concurrent.futures import ThreadPoolExecutor
+import sqlite3
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -88,4 +91,61 @@ def test_event_type_filter_validation_and_sql_injection(client):
     assert client.get("/api/events", params={"event_type": "x" * 101}).status_code == 422
     # A malicious string must be handled as plain data, not SQL.
     assert client.get("/api/events", params={"event_type": "' OR 1=1 --"}).json() == []
+    assert len(client.get("/api/events").json()) == 1
+
+
+def test_idempotency_key_replay_returns_existing_event(client):
+    body = {"event_type": "invoice.paid", "payload": {"amount": 42, "id": "demo"}}
+    first = client.post("/api/events", json=body, headers={"Idempotency-Key": "invoice-42"})
+    second = client.post(
+        "/api/events", json={"event_type": "invoice.paid", "payload": {"id": "demo", "amount": 42}},
+        headers={"Idempotency-Key": "invoice-42"},
+    )
+    assert first.status_code == 201
+    assert second.status_code == 200
+    assert first.json() == second.json()
+    assert len(client.get("/api/events").json()) == 1
+
+
+def test_idempotency_key_conflicts_when_content_changes(client):
+    headers = {"Idempotency-Key": "same-key"}
+    create_body = {"event_type": "invoice.paid", "payload": {"amount": 42}}
+    assert client.post("/api/events", json=create_body, headers=headers).status_code == 201
+    changed_amount = {"event_type": "invoice.paid", "payload": {"amount": 99}}
+    changed_type = {"event_type": "invoice.failed", "payload": {"amount": 42}}
+    assert client.post("/api/events", json=changed_amount, headers=headers).status_code == 409
+    assert client.post("/api/events", json=changed_type, headers=headers).status_code == 409
+    assert len(client.get("/api/events").json()) == 1
+
+
+def test_idempotency_key_is_optional_and_validated(client):
+    body = {"event_type": "invoice.paid", "payload": {}}
+    assert client.post("/api/events", json=body).status_code == 201
+    assert client.post("/api/events", json=body).status_code == 201
+    assert len(client.get("/api/events").json()) == 2
+    for key in ("", "   ", "x" * 129):
+        assert client.post("/api/events", json=body, headers={"Idempotency-Key": key}).status_code == 422
+
+
+def test_idempotency_migrates_existing_database(client, monkeypatch, tmp_path):
+    legacy_db = tmp_path / "legacy.db"
+    with sqlite3.connect(legacy_db) as conn:
+        conn.execute("CREATE TABLE events (id INTEGER PRIMARY KEY, event_type TEXT NOT NULL, payload TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT '')")
+        conn.execute("INSERT INTO events (event_type, payload) VALUES ('legacy', '{}')")
+    monkeypatch.setenv("HOOKLAB_DB", str(legacy_db))
+    from hooklab.database import initialize
+    initialize()
+    initialize()  # Migration is safe on repeated startup.
+    assert client.get("/api/events").json()[0]["event_type"] == "legacy"
+    assert client.post("/api/events", json={"event_type": "new", "payload": {}}, headers={"Idempotency-Key": "new-key"}).status_code == 201
+
+
+def test_parallel_requests_with_same_idempotency_key_create_one_event(client):
+    body = {"event_type": "invoice.paid", "payload": {"id": "parallel"}}
+    def send(_):
+        return client.post("/api/events", json=body, headers={"Idempotency-Key": "parallel"})
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        responses = list(pool.map(send, range(8)))
+    assert sorted(r.status_code for r in responses) == [200] * 7 + [201]
+    assert len({r.json()["id"] for r in responses}) == 1
     assert len(client.get("/api/events").json()) == 1

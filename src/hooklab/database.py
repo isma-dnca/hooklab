@@ -48,3 +48,11 @@ def initialize() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_deliveries_event_id ON deliveries(event_id);
         """)
+        # Upgrade databases created by earlier versions without destroying events.
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(events)")}
+        if "idempotency_key" not in columns:
+            conn.execute("ALTER TABLE events ADD COLUMN idempotency_key TEXT")
+        conn.execute(
+            """CREATE UNIQUE INDEX IF NOT EXISTS idx_events_idempotency_key
+               ON events(idempotency_key) WHERE idempotency_key IS NOT NULL"""
+        )
