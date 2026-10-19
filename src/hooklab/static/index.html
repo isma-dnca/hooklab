@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>HookLab · Local Webhook Playground</title>
+  <style>
+    :root { color-scheme: dark; font-family: system-ui, -apple-system, sans-serif; background: #101827; color: #eff5ff; }
+    body { max-width: 960px; margin: 3rem auto; padding: 0 1rem; }
+    h1 { letter-spacing: -.04em; font-size: 2.5rem; margin-bottom: .2rem; }
+    .sub { color:#9fb2cd; margin-bottom:2rem; }
+    .layout { display:grid; grid-template-columns:1fr 1fr; gap:1.5rem; }
+    .panel { border:1px solid #34445c; background:#172237; border-radius:16px; padding:1.5rem; }
+    label { display:block; margin:.9rem 0 .35rem; color:#bdcae0; }
+    input, textarea, select { box-sizing:border-box; width:100%; color:#f2f7ff; background:#0e1727; padding:.7rem; border:1px solid #53647c; border-radius:8px; font:inherit; }
+    textarea { min-height:110px; resize:vertical; }
+    button { background:#8fc0ff; color:#092038; border:0; border-radius:8px; padding:.7rem 1rem; font:inherit; font-weight:700; margin-top:1rem; cursor:pointer; }
+    button:hover { background:#b4d6ff; }
+    ul { list-style:none; padding:0; }
+    li { border-bottom:1px solid #34445c; padding:.75rem 0; }
+    .meta { color:#9fb2cd; font-size:.88rem; }
+    .status { min-height:1.4rem; color:#acd2fe; }
+    @media(max-width:700px){.layout{grid-template-columns:1fr}}
+  </style>
+</head>
+<body>
+  <h1>HookLab <span aria-hidden="true">↗</span></h1>
+  <p class="sub">A private, local-only sandbox for synthetic webhook events and delivery failures. No real HTTP calls are sent.</p>
+  <main class="layout">
+    <section class="panel">
+      <h2>Create an event</h2>
+      <form id="event-form">
+        <label for="type">Event type</label>
+        <input id="type" value="invoice.paid" required maxlength="100" />
+        <label for="payload">Synthetic JSON payload</label>
+        <textarea id="payload" spellcheck="false">{"invoice_id": "demo-123", "amount": 42}</textarea>
+        <button type="submit">Create event</button>
+      </form>
+      <p role="status" class="status" id="message"></p>
+    </section>
+    <section class="panel">
+      <h2>Events</h2>
+      <form id="filter-form">
+        <label for="filter-type">Filter by event type (exact match)</label>
+        <input id="filter-type" placeholder="e.g. invoice.paid" maxlength="100" />
+        <button type="submit">Apply filter</button>
+        <button type="button" id="clear-filter">Clear</button>
+      </form>
+      <p class="meta" id="events-count"></p>
+      <ul id="events"></ul>
+    </section>
+    <section class="panel">
+      <h2>Simulate a delivery</h2>
+      <form id="delivery-form">
+        <label for="event-id">Event ID</label>
+        <input id="event-id" type="number" min="1" required />
+        <label for="behavior">Behavior</label>
+        <select id="behavior">
+          <option value="success">Always succeeds</option>
+          <option value="fail-once">Fails once, then succeeds</option>
+          <option value="always-fail">Always fails</option>
+        </select>
+        <button type="submit">Run simulation</button>
+      </form>
+    </section>
+    <section class="panel">
+      <h2>Delivery attempts</h2>
+      <ul id="deliveries"></ul>
+    </section>
+  </main>
+  <script>
+    const byId = id => document.getElementById(id);
+    const message = text => byId('message').textContent = text;
+    async function request(path, options) {
+      const response = await fetch(path, options);
+      const data = await response.json();
+      if (!response.ok) throw new Error(JSON.stringify(data.detail ?? data));
+      return data;
+    }
+    let activeEventFilter = '';
+    async function refresh() {
+      const params = new URLSearchParams();
+      if (activeEventFilter) params.set('event_type', activeEventFilter);
+      const eventUrl = `/api/events${params.size ? `?${params.toString()}` : ''}`;
+      const [events, deliveries] = await Promise.all([request(eventUrl), request('/api/deliveries')]);
+      byId('events-count').textContent = `${events.length} event(s) shown`;
+      byId('events').replaceChildren(...events.map(e => {
+        const li = document.createElement('li');
+        li.textContent = `#${e.id}  ${e.event_type}`;
+        return li;
+      }));
+      byId('deliveries').replaceChildren(...deliveries.map(d => {
+        const li = document.createElement('li');
+        li.textContent = `#${d.id} Event ${d.event_id} · ${d.status} · ${d.attempts} attempt(s)`;
+        if (d.status === 'failed') {
+          const button = document.createElement('button');
+          button.textContent = 'Retry';
+          button.addEventListener('click', async () => {
+            try { await request(`/api/deliveries/${d.id}/retry`, {method:'POST'}); await refresh(); }
+            catch(error) { message(error.message); }
+          });
+          li.append(' ', button);
+        }
+        return li;
+      }));
+    }
+    byId('filter-form').addEventListener('submit', async event => {
+      event.preventDefault();
+      activeEventFilter = byId('filter-type').value.trim();
+      try { await refresh(); } catch(error) { message(error.message); }
+    });
+    byId('clear-filter').addEventListener('click', async () => {
+      byId('filter-type').value = '';
+      activeEventFilter = '';
+      try { await refresh(); } catch(error) { message(error.message); }
+    });
+    byId('event-form').addEventListener('submit', async event => {
+      event.preventDefault();
+      try {
+        const data = await request('/api/events', {method:'POST', headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({event_type:byId('type').value,payload:JSON.parse(byId('payload').value)})});
+        byId('event-id').value = data.id;
+        message(`Created event #${data.id}`);
+        await refresh();
+      } catch(error) { message(error.message); }
+    });
+    byId('delivery-form').addEventListener('submit', async event => {
+      event.preventDefault();
+      try {
+        await request(`/api/events/${byId('event-id').value}/deliveries`, {method:'POST',
+          headers:{'Content-Type':'application/json'}, body:JSON.stringify({behavior:byId('behavior').value})});
+        message('Simulation complete');
+        await refresh();
+      } catch(error) { message(error.message); }
+    });
+    refresh().catch(error => message(error.message));
+  </script>
+</body>
+</html>
