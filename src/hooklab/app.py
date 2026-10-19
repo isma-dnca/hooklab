@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 from typing import Any, Literal
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, Header, HTTPException, Query, Response
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
@@ -41,15 +41,53 @@ def health():
 
 
 @app.post("/api/events", status_code=201)
-def create_event(data: EventInput):
-    with connect() as conn:
-        cursor = conn.execute(
-            "INSERT INTO events (event_type, payload) VALUES (?, ?)",
-            (data.event_type, json.dumps(data.payload, sort_keys=True)),
-        )
-        event_id = cursor.lastrowid
-    return get_event(event_id)
+def create_event(
+    data: EventInput,
+    response: Response,
+    idempotency_key: str | None = Header(default=None, min_length=1, max_length=128),
+):
+    """Create an event; replays with an identical idempotency key are safe.
 
+    SQLite's unique index enforces uniqueness even under concurrent requests.
+    A repeated key with different content is a conflict, not a silent overwrite.
+    """
+    payload_json = json.dumps(data.payload, sort_keys=True)
+    if idempotency_key is not None:
+        idempotency_key = idempotency_key.strip()
+        if not idempotency_key:
+            raise HTTPException(status_code=422, detail="Idempotency-Key cannot be blank")
+
+    with connect() as conn:
+        if idempotency_key is None:
+            cursor = conn.execute(
+                "INSERT INTO events (event_type, payload) VALUES (?, ?)",
+                (data.event_type, payload_json),
+            )
+            event_id = cursor.lastrowid
+        else:
+            cursor = conn.execute(
+                """INSERT INTO events (event_type, payload, idempotency_key)
+                   VALUES (?, ?, ?) ON CONFLICT DO NOTHING""",
+                (data.event_type, payload_json, idempotency_key),
+            )
+            if cursor.rowcount:
+                event_id = cursor.lastrowid
+            else:
+                existing = conn.execute(
+                    "SELECT * FROM events WHERE idempotency_key = ?",
+                    (idempotency_key,),
+                ).fetchone()
+                if existing is None:
+                    raise RuntimeError("Idempotency conflict without a matching event")
+                if (existing["event_type"] != data.event_type
+                        or json.loads(existing["payload"]) != data.payload):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Idempotency-Key already used for a different event",
+                    )
+                event_id = existing["id"]
+                response.status_code = 200
+    return get_event(event_id)
 
 def _event_as_dict(row):
     return {"id": row["id"], "event_type": row["event_type"],

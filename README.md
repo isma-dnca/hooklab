@@ -27,6 +27,7 @@ export HOOKLAB_DB="$PWD/hooklab.db"
 ## Current features
 
 - Create and list webhook events with synthetic JSON payloads
+- Idempotent event creation via optional `Idempotency-Key` header (SQLite unique index)
 - Persist data locally with SQLite
 - Simulate success, failure-once, and permanent failure behavior
 - Retry failed deliveries manually
@@ -63,3 +64,20 @@ curl 'http://127.0.0.1:8000/api/events?event_type=invoice.paid&limit=20'
 
 The filter uses a bound SQLite parameter and returns the newest matching events first.
 Clear the filter in the interface to see all events again.
+
+## Idempotent event creation
+
+When a client retries a request, pass a stable `Idempotency-Key` header (1–128 characters):
+
+```bash
+curl -i -X POST http://127.0.0.1:8000/api/events \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: demo-invoice-001' \
+  -d '{"event_type":"invoice.paid","payload":{"invoice_id":"synthetic-001"}}'
+```
+
+The first request creates an event (`201`). Repeating the **same key and content**
+returns the existing event (`200`). Reusing the key with different event content
+returns `409 Conflict`. Without the header, each POST creates a new event.
+Event payloads remain synthetic. Legacy SQLite databases are migrated in place
+on startup, and the unique database index prevents duplicate inserts under concurrency.
